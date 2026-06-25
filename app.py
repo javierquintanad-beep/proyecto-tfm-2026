@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+import dropbox
+import io
 from io import StringIO
 
 # ── Configuración de página ──────────────────────────────────────────────────
@@ -13,8 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── URL del dataset en GitHub ────────────────────────────────────────────────
-CSV_URL = "https://raw.githubusercontent.com/javierquintanad-beep/proyecto-tfm-2026/main/temperature_batch_20260623_021527.csv"
+
 
 # ── Estilos CSS ──────────────────────────────────────────────────────────────
 st.markdown("""
@@ -77,23 +78,56 @@ ZONA_COLORS = {
     "Fría (<15°C)":    "#29b6f6",
 }
 
-# ── Carga de datos ───────────────────────────────────────────────────────────
+# ── Carga de datos desde Dropbox (último CSV de la carpeta) ───────────────────
 @st.cache_data(ttl=300)
 def load_data() -> pd.DataFrame:
-    resp = requests.get(CSV_URL, timeout=15)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text))
+    # Cliente de Dropbox con refresh token (se renueva solo)
+    dbx = dropbox.Dropbox(
+        app_key=st.secrets["DROPBOX_APP_KEY"],
+        app_secret=st.secrets["DROPBOX_APP_SECRET"],
+        oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
+    )
+
+    enlace = st.secrets["DROPBOX_SHARED_LINK"]
+    shared_link = dropbox.files.SharedLink(url=enlace)
+
+    # Listar el contenido de la carpeta compartida (con paginación)
+    entradas = []
+    resultado = dbx.files_list_folder(path="", shared_link=shared_link)
+    entradas.extend(resultado.entries)
+    while resultado.has_more:
+        resultado = dbx.files_list_folder_continue(resultado.cursor)
+        entradas.extend(resultado.entries)
+
+    # Quedarse solo con los CSV
+    csvs = [
+        e for e in entradas
+        if isinstance(e, dropbox.files.FileMetadata) and e.name.endswith(".csv")
+    ]
+    if not csvs:
+        raise FileNotFoundError("No se encontraron CSV en la carpeta de Dropbox")
+
+    # El más reciente (formato temperature_batch_AAAAMMDD_HHMMSS ordena bien por nombre)
+    ultimo = max(csvs, key=lambda e: e.name)
+
+    # Descargar ese archivo a través del enlace compartido
+    _, resp = dbx.sharing_get_shared_link_file(url=enlace, path="/" + ultimo.name)
+    df = pd.read_csv(io.BytesIO(resp.content))
+
+    # ── procesamiento original, sin cambios ──
     for col in ["sampled_at", "observed_at", "generated_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
     df["value_celsius"] = pd.to_numeric(df["value_celsius"], errors="coerce")
     df = df.dropna(subset=["value_celsius", "sampled_at"])
     df = df.sort_values("sampled_at").reset_index(drop=True)
+
     def classify(t):
-        if t >= 50:   return "Alta (>50°C)"
+        if t >= 50: return "Alta (>50°C)"
         elif t >= 35: return "Media (35–50°C)"
         elif t >= 15: return "Baja (15–35°C)"
-        else:         return "Fría (<15°C)"
+        else: return "Fría (<15°C)"
+
     df["zona"] = df["value_celsius"].apply(classify)
     df["tiempo_label"] = df["sampled_at"].dt.strftime("%H:%M:%S")
     return df
@@ -127,7 +161,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Cargar datos ─────────────────────────────────────────────────────────────
-with st.spinner("Cargando datos desde GitHub..."):
+with st.spinner("Cargando datos desde Dropbox..."):
     try:
         df = load_data()
     except Exception as e:
